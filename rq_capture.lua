@@ -39,21 +39,23 @@ local function makeClosure(fn)
 end
 
 -- 1) hook loadstring（含 load），捕获 VM 解密出的明文模块
+-- 用 hookfunction 的返回值作为原始函数，避免自递归
 local function installLoadHook()
 	if not hookfunction then return false end
 	local anyOk = false
 	local function hookOne(target, tag)
 		if type(target) ~= "function" then return end
-		local real = target
-		local function dumper(src, ...)
-			if type(src) == "string" then
-				loadCount = loadCount + 1
-				dumpSource("load", loadCount, src, tag)
-			end
-			return real(src, ...)
-		end
-		local ok = pcall(function() hookfunction(target, makeClosure(dumper)) end)
-		if ok then anyOk = true end
+		local real
+		local ok = pcall(function()
+			real = hookfunction(target, makeClosure(function(src, ...)
+				if type(src) == "string" then
+					loadCount = loadCount + 1
+					dumpSource("load", loadCount, src, tag)
+				end
+				return real(src, ...)
+			end))
+		end)
+		if ok and real then anyOk = true end
 	end
 	hookOne(loadstring, "loadstring")
 	if load and load ~= loadstring then hookOne(load, "load") end
@@ -84,44 +86,6 @@ local function installHttpHook()
 	return ok
 end
 
--- 3) 自动错误网：hook pcall / xpcall，把被静默吞掉的报错自动落盘，返回值原样透传
-local function installErrorHook()
-	if not hookfunction then return false end
-	local realPcall, realXpcall = pcall, xpcall
-	local errCount = 0
-	local function logError(where, msg)
-		errCount = errCount + 1
-		local full = "where=" .. where .. "\n" .. tostring(msg) .. "\n---- traceback ----\n"
-			.. (debug and debug.traceback and debug.traceback() or "no traceback")
-		realPcall(function() writefile(sessionDir .. "/error_" .. string.format("%03d", errCount) .. ".txt", full) end)
-		manifest[#manifest + 1] = "error #" .. errCount .. " " .. where .. " " .. tostring(msg):sub(1, 100)
-		realPcall(function() writefile(sessionDir .. "/manifest.txt", table.concat(manifest, "\n")) end)
-	end
-	local anyOk = false
-	if realPcall then
-		local function hookedPcall(f, ...)
-			local r = realPcall(f, ...)
-			if not r[1] then logError("pcall", r[2]) end
-			return table.unpack(r)
-		end
-		if realPcall(function() hookfunction(pcall, makeClosure(hookedPcall)) end) then anyOk = true end
-	end
-	if realXpcall then
-		local function hookedXpcall(f, handler, ...)
-			local h = handler
-			if type(handler) == "function" then
-				h = function(err)
-					logError("xpcall", err)
-					return handler(err)
-				end
-			end
-			return realXpcall(f, h, ...)
-		end
-		if realPcall(function() hookfunction(xpcall, makeClosure(hookedXpcall)) end) then anyOk = true end
-	end
-	return anyOk
-end
-
 ensureDir()
 pcall(function()
 	writefile(sessionDir .. "/readme.txt",
@@ -133,12 +97,10 @@ end)
 
 local lsOk = installLoadHook()
 local httpOk = installHttpHook()
-local errOk = installErrorHook()
 
 print("================ 小草捕获 ================")
 print("loadstring hook = " .. tostring(lsOk))
 print("http hook       = " .. tostring(httpOk))
-print("error hook      = " .. tostring(errOk))
 print("capture folder  = " .. sessionDir)
 print("==========================================")
 
