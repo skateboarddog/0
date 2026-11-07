@@ -1,14 +1,20 @@
 -- ============================================================
--- 小草 / Rage Quit 运行时全量捕获脚本（Potassium 手机端单文件）
--- 原理：先 hook 全局 loadstring 和 game 的 HttpGet，再走官方
--- QuantumOnyx 真实加载链 + 你的高级卡密。Luarmor VM 解密出的
--- 每个明文模块、每次远程拉取的脚本，都会原样写进本地目录。
--- hook 不改动任何返回值，官方功能照常运行。
+-- 小草 / Rage Quit 运行时全量捕获（Potassium 手机端）
+-- 设计：hook 只做"入队"（极薄、不写盘、不 pcall），独立后台
+-- 协程负责写盘，避免在 Luarmor 深调用栈上做重操作导致 C stack
+-- overflow。先自检，确认 hook 安全透传后，再自动启动官方链。
 -- ============================================================
 
 local sessionDir = "rq_dump_" .. tostring(os.time and os.time() or "0")
-local loadCount, httpCount = 0, 0
-local manifest = {}
+local ENTRY_URL = "https://raw.githubusercontent.com/flazhy/QuantumOnyx/refs/heads/main/QuantumOnyx.lua"
+
+-- 捕获队列：hook 只往这里塞，写盘协程从这里取
+local queue = {}
+local qhead = 1
+local loadN, httpN = 0, 0
+local manifestLines = {}
+
+local function fmt3(n) return string.format("%03d", n) end
 
 local function ensureDir()
 	pcall(function()
@@ -16,21 +22,30 @@ local function ensureDir()
 	end)
 end
 
-local function writeManifest()
-	pcall(function()
-		writefile(sessionDir .. "/manifest.txt", table.concat(manifest, "\n"))
-	end)
-end
+-- 后台写盘协程：与 hook 调用栈解耦
+task.spawn(function()
+	while true do
+		local item = queue[qhead]
+		if item then
+			queue[qhead] = nil
+			qhead = qhead + 1
+			if item.kind == "load" then
+				loadN = loadN + 1
+				pcall(writefile, sessionDir .. "/load_" .. fmt3(loadN) .. ".lua", item.src)
+				manifestLines[#manifestLines + 1] = "load #" .. loadN .. " len=" .. #item.src .. " " .. tostring(item.extra)
+			elseif item.kind == "http" then
+				httpN = httpN + 1
+				pcall(writefile, sessionDir .. "/http_" .. fmt3(httpN) .. ".lua", item.src)
+				manifestLines[#manifestLines + 1] = "http #" .. httpN .. " len=" .. #item.src .. " " .. tostring(item.extra)
+			end
+			pcall(writefile, sessionDir .. "/manifest.txt", table.concat(manifestLines, "\n"))
+		else
+			task.wait(0.05)
+		end
+	end
+end)
 
-local function dumpSource(prefix, n, src, extra)
-	if type(src) ~= "string" then return end
-	local path = sessionDir .. "/" .. prefix .. "_" .. string.format("%03d", n) .. ".lua"
-	pcall(function() writefile(path, src) end)
-	manifest[#manifest + 1] = prefix .. " #" .. n .. " len=" .. #src .. (extra and (" " .. extra) or "")
-	writeManifest()
-end
-
-local function makeClosure(fn)
+local function wrap(fn)
 	if newcclosure then
 		local ok, c = pcall(newcclosure, fn)
 		if ok then return c end
@@ -38,80 +53,86 @@ local function makeClosure(fn)
 	return fn
 end
 
--- 1) hook loadstring（含 load），捕获 VM 解密出的明文模块
--- 用 hookfunction 的返回值作为原始函数，避免自递归
-local function installLoadHook()
-	if not hookfunction then return false end
-	local anyOk = false
-	local function hookOne(target, tag)
-		if type(target) ~= "function" then return end
-		local real
-		local ok = pcall(function()
-			real = hookfunction(target, makeClosure(function(src, ...)
-				if type(src) == "string" then
-					loadCount = loadCount + 1
-					dumpSource("load", loadCount, src, tag)
-				end
-				return real(src, ...)
-			end))
-		end)
-		if ok and real then anyOk = true end
-	end
-	hookOne(loadstring, "loadstring")
-	if load and load ~= loadstring then hookOne(load, "load") end
-	return anyOk
+-- 1) hook loadstring（极薄，只入队）
+local loadHookOk = false
+local realLoad
+if hookfunction and loadstring then
+	local ok = pcall(function()
+		realLoad = hookfunction(loadstring, wrap(function(src, ...)
+			if type(src) == "string" then
+				queue[#queue + 1] = { kind = "load", src = src, extra = "loadstring" }
+			end
+			return realLoad(src, ...)
+		end))
+	end)
+	loadHookOk = ok and realLoad ~= nil
 end
 
--- 2) hook game __namecall，捕获所有 HttpGet / HttpGetAsync
-local function installHttpHook()
-	if not hookmetamethod then return false end
+-- 2) hook game __namecall，捕获 HttpGet / HttpGetAsync（极薄，只入队）
+local httpHookOk = false
+if hookmetamethod then
 	local old
-	local function handler(...)
-		local method = getnamecallmethod and getnamecallmethod() or ""
-		local m = tostring(method)
-		if m == "HttpGet" or m == "HttpGetAsync" or m:find("HttpGet", 1, true) then
-			local url = select(2, ...)
-			local result = old(...)
-			if type(result) == "string" then
-				httpCount = httpCount + 1
-				dumpSource("http", httpCount, result, "url=" .. tostring(url))
-			end
-			return result
-		end
-		return old(...)
-	end
 	local ok = pcall(function()
-		old = hookmetamethod(game, "__namecall", makeClosure(handler))
+		old = hookmetamethod(game, "__namecall", wrap(function(...)
+			local method = getnamecallmethod and getnamecallmethod() or ""
+			local m = tostring(method)
+			if m == "HttpGet" or m == "HttpGetAsync" or string.find(m, "HttpGet", 1, true) then
+				local url = select(2, ...)
+				local result = old(...)
+				if type(result) == "string" then
+					queue[#queue + 1] = { kind = "http", src = result, extra = "url=" .. tostring(url) }
+				end
+				return result
+			end
+			return old(...)
+		end))
 	end)
-	return ok
+	httpHookOk = ok and old ~= nil
 end
 
 ensureDir()
-pcall(function()
-	writefile(sessionDir .. "/readme.txt",
-		"capture dir: " .. sessionDir .. "\n" ..
-		"load_###.lua = plaintext modules the Luarmor VM loads via loadstring\n" ..
-		"http_###.lua = scripts fetched via HttpGet (see url in manifest.txt)\n" ..
-		"manifest.txt = ordered capture log\n")
-end)
-
-local lsOk = installLoadHook()
-local httpOk = installHttpHook()
+pcall(writefile, sessionDir .. "/readme.txt",
+	"capture dir: " .. sessionDir .. "\n" ..
+	"load_###.lua = plaintext modules the Luarmor VM loads via loadstring\n" ..
+	"http_###.lua = scripts fetched via HttpGet (see url in manifest.txt)\n" ..
+	"manifest.txt = ordered capture log\n")
 
 print("================ 小草捕获 ================")
-print("loadstring hook = " .. tostring(lsOk))
-print("http hook       = " .. tostring(httpOk))
+print("loadstring hook = " .. tostring(loadHookOk))
+print("http hook       = " .. tostring(httpHookOk))
 print("capture folder  = " .. sessionDir)
 print("==========================================")
 
--- 3) 走官方真实入口（卡密在弹出的官方窗口里你本人输入）
-local ENTRY_URL = "https://raw.githubusercontent.com/flazhy/QuantumOnyx/refs/heads/main/QuantumOnyx.lua"
-local started = pcall(function()
-	local entry = game:HttpGet(ENTRY_URL)
-	local f, err = loadstring(entry)
-	if not f then error(tostring(err)) end
-	f()
-end)
+-- 自检：先证明 hook 能安全透传、不递归，再启动官方链
+local selfTestOk = true
 
-print("官方链启动 = " .. tostring(started))
-print("不用点任何功能：主菜单加载出来、等约10秒，把 " .. sessionDir .. " 整个目录发我即可。")
+local t1ok, t1err = pcall(function()
+	local f = loadstring("return 123")
+	if not f then error("loadstring returned nil") end
+	if f() ~= 123 then error("loadstring result mismatch") end
+end)
+if not t1ok then selfTestOk = false; print("[自检] loadstring 失败: " .. tostring(t1err)) end
+
+-- 自检 http，同时拿到官方入口源码（不重复请求）
+local entrySrc
+local t2ok, t2err = pcall(function()
+	entrySrc = game:HttpGet(ENTRY_URL)
+	if type(entrySrc) ~= "string" or #entrySrc < 100 then error("bad entry source") end
+end)
+if not t2ok then selfTestOk = false; print("[自检] http 失败: " .. tostring(t2err)) end
+
+print("自检结果 = " .. tostring(selfTestOk))
+
+if selfTestOk then
+	-- 3) 自动启动官方真实链（卡密在弹出的官方窗口里你本人输入）
+	local started = pcall(function()
+		local f, err = loadstring(entrySrc)
+		if not f then error(tostring(err)) end
+		f()
+	end)
+	print("官方链启动 = " .. tostring(started))
+else
+	print("自检未通过，已停止、不启动官方链。把上面诊断截图发我。")
+end
+
+print("不用点任何功能：主菜单出来后等约15秒让后台写盘完成，把 " .. sessionDir .. " 整个目录发我。")
